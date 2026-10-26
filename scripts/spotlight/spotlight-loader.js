@@ -20,6 +20,13 @@
   var currentHomeTab = null;
   var currentFavoritesTab = null;
   var currentIframe = null;
+  // The iframe only becomes keyboard/gamepad-focusable once it reports "ready".
+  // If its script never runs (e.g. an older TV browser can't parse it) it stays
+  // out of the focus order, so arrow keys can't get trapped in a dead frame.
+  var spotlightReady = false;
+  var spotlightFailed = false;
+  var READY_TIMEOUT_MS = 10000;
+  var readyTimer = null;
   var backdropOverlay = null;
   var backdropLayerA = null;
   var backdropLayerB = null;
@@ -72,6 +79,9 @@
     currentIframe = null;
     currentSync = null;
     spotlightFocused = false;
+    spotlightReady = false;
+    spotlightFailed = false;
+    if (readyTimer) { clearTimeout(readyTimer); readyTimer = null; }
     document.documentElement.classList.remove("abyss-spotlight-visible");
     clearSpotlightBackdrop();
   }
@@ -169,29 +179,117 @@
     return tag === "INPUT" || tag === "TEXTAREA" || (el && el.isContentEditable);
   }
 
-  function nearestFocusable(originRect, direction, pool) {
-    var originX = originRect.left + originRect.width / 2;
-    var originY = direction === "up" ? originRect.top : originRect.bottom;
+  var NAV_SELECTOR = [
+    "a[href]", "button:not([disabled])", "input:not([disabled]):not([type=hidden])",
+    "select:not([disabled])", "textarea:not([disabled])", "[tabindex]:not([tabindex='-1'])",
+    "[role=menuitem]", "[role=tab]", ".focusable"
+  ].join(",");
+  // Hover-only overlay controls and secondary links would otherwise add extra stops inside every card.
+  var NAV_SKIP = ".cardOverlayButton, .cardOverlayContainer, .textActionButton, .cardText a, .MuiBackdrop-root, [tabindex='-1']:not([role=menuitem])";
+  var OVERLAY_SELECTOR = ".MuiMenu-root, .MuiPopover-root, .MuiDialog-root, .MuiDrawer-root .MuiDrawer-paper[role], .dialogContainer, .actionSheet";
 
-    var candidates = pool.filter(function (el) {
-      if (!el.isConnected) return false;
-      var r = el.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) return false;
-      return direction === "down" ? r.top >= originRect.bottom - 4 : r.bottom <= originRect.top + 4;
-    });
-
-    if (!candidates.length) return null;
-
-    candidates.sort(function (a, b) {
-      var ra = a.getBoundingClientRect();
-      var rb = b.getBoundingClientRect();
-      var da = Math.hypot(ra.left + ra.width / 2 - originX, ra.top - originY);
-      var db = Math.hypot(rb.left + rb.width / 2 - originX, rb.top - originY);
-      return da - db;
-    });
-
-    return candidates[0];
+  function isShown(el) {
+    if (!el || !el.isConnected || el.getClientRects().length === 0) return false;
+    var r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    return window.getComputedStyle(el).visibility !== "hidden";
   }
+
+  function openOverlay() {
+    var list = document.querySelectorAll(OVERLAY_SELECTOR);
+    for (var i = list.length - 1; i >= 0; i--) {
+      if (isShown(list[i]) && list[i].querySelector(NAV_SELECTOR)) return list[i];
+    }
+    return null;
+  }
+
+  // Everything arrow-key navigation may land on; confined to the open menu/dialog if there is one.
+  function collectNavCandidates() {
+    var root = openOverlay() || document;
+    return Array.prototype.filter.call(root.querySelectorAll(NAV_SELECTOR), function (el) {
+      return !el.matches(NAV_SKIP) && !el.closest("[aria-hidden='true']") && isShown(el);
+    });
+  }
+
+  function nearestFocusable(originRect, direction, pool) {
+    var horizontal = direction === "left" || direction === "right";
+    var ocx = originRect.left + originRect.width / 2;
+    var ocy = originRect.top + originRect.height / 2;
+    var active = document.activeElement;
+    var best = null;
+    var bestScore = Infinity;
+
+    pool.forEach(function (el) {
+      if (!el.isConnected || el === active) return;
+      if (active && active !== document.body && (el.contains(active) || active.contains(el))) return;
+      var r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return;
+
+      var gap, cross;
+      if (direction === "down") { if (r.top < originRect.bottom - 4) return; gap = r.top - originRect.bottom; cross = Math.abs(r.left + r.width / 2 - ocx); }
+      else if (direction === "up") { if (r.bottom > originRect.top + 4) return; gap = originRect.top - r.bottom; cross = Math.abs(r.left + r.width / 2 - ocx); }
+      else if (direction === "right") { if (r.left < originRect.right - 4) return; gap = r.left - originRect.right; cross = Math.abs(r.top + r.height / 2 - ocy); }
+      else { if (r.right > originRect.left + 4) return; gap = originRect.left - r.right; cross = Math.abs(r.top + r.height / 2 - ocy); }
+
+      // Sideways moves stay in the current row.
+      if (horizontal && (r.top >= originRect.bottom || r.bottom <= originRect.top)) return;
+
+      var score = Math.max(gap, 0) + cross * 2;
+      if (score < bestScore) { best = el; bestScore = score; }
+    });
+    return best;
+  }
+
+  var PAD_FOCUS_CLASS = "abyss-pad-focus";
+
+  function ensureFocusStyle() {
+    if (document.getElementById("abyss-pad-focus-style")) return;
+    var style = document.createElement("style");
+    style.id = "abyss-pad-focus-style";
+    style.textContent = "." + PAD_FOCUS_CLASS + "{outline:3px solid rgba(var(--abyss-accent,245,245,247),.9)!important;outline-offset:3px;border-radius:12px;}";
+    document.head.appendChild(style);
+  }
+
+  function focusElement(el) {
+    ensureFocusStyle();
+    var old = document.querySelectorAll("." + PAD_FOCUS_CLASS);
+    for (var i = 0; i < old.length; i++) old[i].classList.remove(PAD_FOCUS_CLASS);
+    el.classList.add(PAD_FOCUS_CLASS);
+    el.addEventListener("blur", function onBlur() {
+      el.classList.remove(PAD_FOCUS_CLASS);
+      el.removeEventListener("blur", onBlur);
+    });
+    try { el.focus({ preventScroll: true }); } catch (e) { el.focus(); }
+    if (el.closest("header, .skinHeader")) {
+      try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch (e) { window.scrollTo(0, 0); }
+      return;
+    }
+    var tall = el.getBoundingClientRect().height > window.innerHeight * 0.6;
+    try { el.scrollIntoView({ block: tall ? "start" : "center", inline: "nearest", behavior: "smooth" }); } catch (e) { /* old engine */ }
+  }
+
+  // Desktop layout: Jellyfin doesn't move focus on arrow keys, so do it here.
+  // (TV layout has Jellyfin's own navigation, which we leave alone.)
+  var NATIVE_ARROW_TAGS = { INPUT: 1, TEXTAREA: 1, SELECT: 1, VIDEO: 1 };
+
+  document.addEventListener("keydown", function (event) {
+    var direction = { ArrowDown: "down", ArrowUp: "up", ArrowLeft: "left", ArrowRight: "right" }[event.key];
+    if (!direction || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    if (document.documentElement.classList.contains("layout-tv")) return;
+    if (/^#\/video/.test(location.hash)) return;
+    var active = document.activeElement;
+    if (active && (NATIVE_ARROW_TAGS[active.tagName] || active.isContentEditable || active.getAttribute("role") === "slider")) return;
+
+    var origin = active && active !== document.body && isShown(active)
+      ? active.getBoundingClientRect()
+      : { left: 0, right: 0, top: 0, bottom: 0, width: 0, height: 0 };
+    var target = nearestFocusable(origin, direction, collectNavCandidates());
+    if (!target) return; // nothing that way: let the page scroll as normal
+
+    event.preventDefault();
+    if (target === currentIframe && spotlightReady) { enterSpotlight(target); return; }
+    focusElement(target);
+  });
 
   function enterSpotlight(iframe) {
     spotlightFocused = true;
@@ -201,15 +299,14 @@
 
   document.addEventListener("keydown", function (event) {
     if (spotlightFocused) return; // events go straight to the iframe's own document while it holds focus
-    if (!currentIframe || !currentIframe.isConnected) return;
+    if (!currentIframe || !currentIframe.isConnected || !spotlightReady) return;
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
 
     var active = document.activeElement;
     if (!active || active === document.body || isEditableElement(active)) return;
 
     var direction = event.key === "ArrowDown" ? "down" : "up";
-    var pool = Array.prototype.slice.call(document.querySelectorAll(".focusable")).concat([currentIframe]);
-    var nearest = nearestFocusable(active.getBoundingClientRect(), direction, pool);
+    var nearest = nearestFocusable(active.getBoundingClientRect(), direction, collectNavCandidates());
 
     if (nearest === currentIframe) {
       event.preventDefault();
@@ -221,12 +318,17 @@
   function focusNearestOutside(iframe, direction) {
     try {
       var rect = iframe.getBoundingClientRect();
-      var pool = Array.prototype.slice
-        .call(document.querySelectorAll(".focusable"))
-        .filter(function (el) { return el !== iframe; });
-      var nearest = nearestFocusable(rect, direction, pool);
+      // Up from the frame goes to the top nav (the current section's button), even when the
+      // frame has scrolled partly under the fixed header and nothing is strictly above it.
+      var nearest = null;
+      if (direction === "up") {
+        var tabs = collectNavTabs();
+        if (tabs.length) nearest = tabs[Math.max(activeTabIndex(tabs), 0)];
+      }
+      var pool = collectNavCandidates().filter(function (el) { return el !== iframe; });
+      if (!nearest) nearest = nearestFocusable(rect, direction, pool);
       if (!nearest) return false;
-      nearest.focus();
+      focusElement(nearest);
       return true;
     } catch (e) {
       return false;
@@ -236,6 +338,15 @@
   window.addEventListener("message", function (event) {
     if (!currentIframe || event.source !== currentIframe.contentWindow) return;
     if (!event.data || event.data.type !== "abyss-spotlight") return;
+    if (event.data.action === "ready") {
+      spotlightReady = true;
+      spotlightFailed = false;
+      if (readyTimer) { clearTimeout(readyTimer); readyTimer = null; }
+      currentIframe.classList.add("focusable");
+      currentIframe.setAttribute("tabindex", "0");
+      if (currentSync) safe(currentSync);
+      return;
+    }
     if (event.data.action === "leave") {
       spotlightFocused = false;
       safe(function () {
@@ -271,7 +382,9 @@
           return;
         }
         var favoritesActive = !!(favoritesTab && favoritesTab.classList && favoritesTab.classList.contains("is-active"));
-        var active = isRouteVisible(indexPage, homeTab) && !favoritesActive;
+        var active = isRouteVisible(indexPage, homeTab) && !favoritesActive && !spotlightFailed;
+        indexPage.classList.toggle("abyss-spotlight-active", !spotlightFailed);
+        homeTab.classList.toggle("abyss-spotlight-active", !spotlightFailed);
         var action = active ? "resume" : "pause";
         document.documentElement.classList.toggle("abyss-spotlight-visible", active);
         iframe.style.display = active ? "block" : "none";
@@ -354,8 +467,8 @@
       var iframe = homeTab.querySelector ? homeTab.querySelector("." + FRAME_CLASS) : null;
       if (!iframe) {
         iframe = document.createElement("iframe");
-        iframe.className = FRAME_CLASS + " focusable";
-        iframe.setAttribute("tabindex", "0");
+        iframe.className = FRAME_CLASS;
+        iframe.setAttribute("tabindex", "-1");
         iframe.src = spotlightUrl;
         iframe.title = "Abyss Spotlight";
         iframe.addEventListener("blur", function () { spotlightFocused = false; });
@@ -379,6 +492,13 @@
         currentFavoritesTab = favoritesTab;
         currentIframe = iframe;
         currentSync = connectLifecycle(indexPage, homeTab, favoritesTab, iframe);
+        if (readyTimer) clearTimeout(readyTimer);
+        readyTimer = setTimeout(function () {
+          readyTimer = null;
+          if (spotlightReady) return;
+          spotlightFailed = true;
+          if (currentSync) safe(currentSync);
+        }, READY_TIMEOUT_MS);
       }
       installed = true;
     });
@@ -440,6 +560,196 @@
       }
     });
   }
+
+  // Jellyfin only moves focus on arrow keys in its TV layout, and "Auto" doesn't
+  // always detect an Xbox. Default Xbox clients to TV once, unless a layout was chosen.
+  safe(function () {
+    if (/Xbox/i.test(navigator.userAgent) && !localStorage.getItem("layout")) {
+      localStorage.setItem("layout", "tv");
+      location.reload();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Gamepad support (Standard Gamepad mapping, e.g. Xbox controllers)
+  //   LB / RB      previous / next section in the nav bar
+  //   D-pad/stick  move focus (sent as arrow keys, only if the host isn't already doing it)
+  //   A / B        select / back
+  //   Menu         open / close the user menu (settings etc.)
+  // ---------------------------------------------------------------------------
+  var PAD_LB = 4, PAD_RB = 5, PAD_A = 0, PAD_B = 1, PAD_MENU = 9;
+  var PAD_DPAD = { 12: "ArrowUp", 13: "ArrowDown", 14: "ArrowLeft", 15: "ArrowRight" };
+  var ARROW_CODES = { ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39 };
+  var STICK_THRESHOLD = 0.6;
+  var REPEAT_DELAY_MS = 400;
+  var REPEAT_RATE_MS = 130;
+  var HOST_CHECK_MS = 90;
+
+  var padLoopRunning = false;
+  var padPrev = {};          // button index -> pressed last frame
+  var padHeld = null;        // { key, next } for the direction currently held
+  var hostTranslatesPad = false; // true once the platform is seen turning pad input into real key events
+  var lastTrustedArrowAt = 0;
+
+  document.addEventListener("keydown", function (event) {
+    if (event.isTrusted && ARROW_CODES[event.key]) lastTrustedArrowAt = Date.now();
+  }, true);
+
+  function isVisible(el) {
+    return !!el && el.isConnected && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.getClientRects().length > 0);
+  }
+
+  function collectNavTabs() {
+    var sets = [
+      "header.MuiAppBar-root > .MuiToolbar-root > .MuiStack-root:first-of-type .MuiButton-root",
+      ".headerTabs .emby-tab-button"
+    ];
+    for (var i = 0; i < sets.length; i++) {
+      var found = Array.prototype.filter.call(document.querySelectorAll(sets[i]), isVisible);
+      if (found.length > 1) return found;
+    }
+    return [];
+  }
+
+  function activeTabIndex(tabs) {
+    for (var i = 0; i < tabs.length; i++) {
+      var t = tabs[i];
+      if (t.classList.contains("MuiButton-colorPrimary") || t.classList.contains("emby-tab-button-active") ||
+        t.getAttribute("aria-current") || t.getAttribute("aria-selected") === "true") return i;
+    }
+    return -1;
+  }
+
+  function switchNavSection(step) {
+    var tabs = collectNavTabs();
+    if (!tabs.length) return;
+    var current = activeTabIndex(tabs);
+    var next = current < 0 ? (step > 0 ? 0 : tabs.length - 1) : current + step;
+    if (next < 0 || next >= tabs.length || next === current) return;
+    tabs[next].click();
+  }
+
+  function keyTarget() {
+    if (spotlightFocused && currentIframe) {
+      try {
+        var d = currentIframe.contentDocument;
+        return (d && d.activeElement) || d.body;
+      } catch (e) { /* cross-origin frame, fall through */ }
+    }
+    return document.activeElement || document.body;
+  }
+
+  function sendArrow(key) {
+    var target = keyTarget();
+    if (!target) return;
+    var view = target.ownerDocument.defaultView || window;
+    var ev = new view.KeyboardEvent("keydown", {
+      key: key, code: key, keyCode: ARROW_CODES[key], which: ARROW_CODES[key],
+      bubbles: true, cancelable: true
+    });
+    target.dispatchEvent(ev);
+  }
+
+  function pressDirection(key) {
+    if (hostTranslatesPad) return; // real key events are already arriving
+    var pressedAt = Date.now();
+    setTimeout(function () {
+      if (lastTrustedArrowAt >= pressedAt) { hostTranslatesPad = true; return; }
+      sendArrow(key);
+    }, padHeld && padHeld.repeating ? 0 : HOST_CHECK_MS);
+  }
+
+  function activateFocused() {
+    var el = keyTarget();
+    if (!el || el === document.body || isEditableElement(el)) return;
+    if (typeof el.click === "function") el.click();
+  }
+
+  function closeOverlay() {
+    var overlay = openOverlay();
+    if (!overlay) return false;
+    var esc = { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true };
+    (document.activeElement || document.body).dispatchEvent(new KeyboardEvent("keydown", esc));
+    if (openOverlay()) {
+      var backdrop = document.querySelector(".MuiBackdrop-root");
+      if (backdrop) backdrop.click();
+    }
+    return true;
+  }
+
+  function toggleMenu() {
+    if (closeOverlay()) return;
+    var btn = document.querySelector("header button[aria-label='User Menu']") ||
+      document.querySelector("header button[aria-label*='drawer' i], .mainDrawerButton");
+    if (!btn || !isShown(btn)) return;
+    btn.click();
+    setTimeout(function () {
+      var overlay = openOverlay();
+      if (!overlay || overlay.contains(document.activeElement)) return;
+      var first = overlay.querySelector("[role=menuitem], " + NAV_SELECTOR);
+      if (first) focusElement(first);
+    }, 200);
+  }
+
+  function goBack() {
+    if (closeOverlay()) return;
+    if (/^#\/?(home)?(\?.*)?$/.test(location.hash) || location.hash === "#/home.html") return;
+    history.back();
+  }
+
+  function pollGamepads() {
+    var pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    var pad = null;
+    for (var i = 0; i < pads.length; i++) {
+      if (pads[i] && pads[i].connected) { pad = pads[i]; break; }
+    }
+    if (!pad) { padLoopRunning = false; padPrev = {}; padHeld = null; return; }
+
+    if (!document.hidden) {
+      var down = function (n) { return !!(pad.buttons[n] && pad.buttons[n].pressed); };
+      var edge = function (n) { var d = down(n); var was = padPrev[n]; padPrev[n] = d; return d && !was; };
+
+      if (edge(PAD_LB)) safe(function () { switchNavSection(-1); });
+      if (edge(PAD_RB)) safe(function () { switchNavSection(1); });
+      if (edge(PAD_MENU)) safe(toggleMenu);
+      if (edge(PAD_A) && !hostTranslatesPad) safe(activateFocused);
+      if (edge(PAD_B) && !hostTranslatesPad) safe(goBack);
+
+      var dir = null;
+      for (var b in PAD_DPAD) { if (down(+b)) dir = PAD_DPAD[b]; }
+      if (!dir && pad.axes.length >= 2) {
+        var x = pad.axes[0], y = pad.axes[1];
+        if (Math.abs(x) > STICK_THRESHOLD || Math.abs(y) > STICK_THRESHOLD) {
+          dir = Math.abs(x) > Math.abs(y) ? (x > 0 ? "ArrowRight" : "ArrowLeft") : (y > 0 ? "ArrowDown" : "ArrowUp");
+        }
+      }
+
+      var now = Date.now();
+      if (!dir) {
+        padHeld = null;
+      } else if (!padHeld || padHeld.key !== dir) {
+        padHeld = { key: dir, next: now + REPEAT_DELAY_MS, repeating: false };
+        safe(function () { pressDirection(dir); });
+      } else if (now >= padHeld.next) {
+        padHeld.next = now + REPEAT_RATE_MS;
+        padHeld.repeating = true;
+        safe(function () { pressDirection(dir); });
+      }
+    }
+    requestAnimationFrame(pollGamepads);
+  }
+
+  function startGamepadLoop() {
+    if (padLoopRunning || typeof requestAnimationFrame !== "function") return;
+    padLoopRunning = true;
+    requestAnimationFrame(pollGamepads);
+  }
+
+  safe(function () {
+    window.addEventListener("gamepadconnected", startGamepadLoop);
+    // Some consoles never fire gamepadconnected until a button is pressed; check anyway.
+    if (navigator.getGamepads) startGamepadLoop();
+  });
 
   start();
 })();

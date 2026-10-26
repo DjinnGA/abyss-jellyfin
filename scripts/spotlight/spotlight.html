@@ -87,14 +87,20 @@
 
 			function isTvLayout() {
 				try {
-					return window.top.document.body.classList.contains('layout-tv');
+					const top = window.top.document;
+					// Jellyfin puts the layout class on <html>; older builds used <body>.
+					return top.documentElement.classList.contains('layout-tv') || top.body.classList.contains('layout-tv');
 				} catch {
 					return false;
 				}
 			}
 
-			const tvMode = isTvLayout();
-			if (tvMode) document.body.classList.add('tv-mode');
+			let tvMode = false;
+			function setTvMode(on) {
+				tvMode = on;
+				document.body.classList.toggle('tv-mode', on);
+			}
+			setTvMode(isTvLayout());
 
 			let tvActive = false;
 			let tvFocusables = [];
@@ -778,7 +784,12 @@
 				const { action } = event.data;
 				if (action === 'pause') pause();
 				if (action === 'resume') resume();
-				if (action === 'tv-focus') enterTvFocus();
+				if (action === 'tv-focus') {
+					// Parent only sends this on a d-pad/gamepad press, so it is a TV-style client
+					// even when Jellyfin didn't add layout-tv (e.g. layout set to Auto).
+					if (!tvMode) setTvMode(true);
+					enterTvFocus();
+				}
 			});
 			document.addEventListener('visibilitychange', () => { document.hidden ? pause() : resume(); });
 			window.addEventListener('pagehide', dispose, { once: true });
@@ -795,6 +806,7 @@
 
 			checkForUpdate(base, token, userId);
 			if (!document.hidden) resume();
+			try { window.parent.postMessage({ type: 'abyss-spotlight', action: 'ready' }, window.location.origin); } catch { /* standalone */ }
 		})();
 	</script>
 </body>
