@@ -583,7 +583,8 @@
   var STICK_THRESHOLD = 0.6;
   var REPEAT_DELAY_MS = 400;
   var REPEAT_RATE_MS = 130;
-  var HOST_CHECK_MS = 90;
+  var HOST_CHECK_MS = 150;
+  var HOST_WINDOW_MS = 300;
 
   var padLoopRunning = false;
   var padPrev = {};          // button index -> pressed last frame
@@ -591,8 +592,13 @@
   var hostTranslatesPad = false; // true once the platform is seen turning pad input into real key events
   var lastTrustedArrowAt = 0;
 
+  var lastPadDirAt = 0;
+
   document.addEventListener("keydown", function (event) {
-    if (event.isTrusted && ARROW_CODES[event.key]) lastTrustedArrowAt = Date.now();
+    if (!event.isTrusted || !ARROW_CODES[event.key]) return;
+    lastTrustedArrowAt = Date.now();
+    // A real arrow key right next to a pad press means the host is already translating the pad.
+    if (Math.abs(lastTrustedArrowAt - lastPadDirAt) < HOST_WINDOW_MS) hostTranslatesPad = true;
   }, true);
 
   function isVisible(el) {
@@ -653,8 +659,11 @@
   function pressDirection(key) {
     if (hostTranslatesPad) return; // real key events are already arriving
     var pressedAt = Date.now();
+    lastPadDirAt = pressedAt;
+    // The host's key can land just before this poll sees the press, or just after.
+    if (pressedAt - lastTrustedArrowAt < HOST_WINDOW_MS) { hostTranslatesPad = true; return; }
     setTimeout(function () {
-      if (lastTrustedArrowAt >= pressedAt) { hostTranslatesPad = true; return; }
+      if (hostTranslatesPad || lastTrustedArrowAt >= pressedAt) { hostTranslatesPad = true; return; }
       sendArrow(key);
     }, padHeld && padHeld.repeating ? 0 : HOST_CHECK_MS);
   }
@@ -671,17 +680,25 @@
     var esc = { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true };
     (document.activeElement || document.body).dispatchEvent(new KeyboardEvent("keydown", esc));
     if (openOverlay()) {
-      var backdrop = document.querySelector(".MuiBackdrop-root");
+      var backdrop = document.querySelector(".MuiBackdrop-root, .dialogBackdrop");
       if (backdrop) backdrop.click();
     }
     return true;
   }
 
+  var lastMenuAt = 0;
+
   function toggleMenu() {
+    var now = Date.now();
+    if (now - lastMenuAt < 400) return; // pad API and host key events can both report one press
+    lastMenuAt = now;
     if (closeOverlay()) return;
-    var btn = document.querySelector("header button[aria-label='User Menu']") ||
-      document.querySelector("header button[aria-label*='drawer' i], .mainDrawerButton");
-    if (!btn || !isShown(btn)) return;
+    // MUI header (desktop) and the legacy header (TV layout) name the user button differently.
+    var candidates = document.querySelectorAll(
+      "header button[aria-label='User Menu'], .headerUserButton, header button[aria-label*='drawer' i], .mainDrawerButton");
+    var btn = null;
+    for (var i = 0; i < candidates.length && !btn; i++) if (isShown(candidates[i])) btn = candidates[i];
+    if (!btn) return;
     btn.click();
     setTimeout(function () {
       var overlay = openOverlay();
@@ -696,6 +713,11 @@
     if (/^#\/?(home)?(\?.*)?$/.test(location.hash) || location.hash === "#/home.html") return;
     history.back();
   }
+
+  // Some hosts (e.g. Xbox) report the Menu button as a key rather than a pad button.
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "GamepadMenu" || event.keyCode === 207) safe(toggleMenu);
+  }, true);
 
   function pollGamepads() {
     var pads = navigator.getGamepads ? navigator.getGamepads() : [];
